@@ -94,8 +94,11 @@ function validPayload(payload, allowedKeys) {
 }
 
 function createDemoServer() {
+  // Each demo user owns a capped in-memory inbox; this state is not durable storage.
   const histories = new Map(USERS.map((user) => [user.id, []]));
+  let actionQueue = Promise.resolve();
 
+  // This HTTP server serves pages and APIs. Socket.IO attaches below on the same port.
   const server = http.createServer((req, res) => {
     let pathname;
     try {
@@ -147,26 +150,31 @@ function createDemoServer() {
     sendText(res, 404, "Not found", method);
   });
 
+  // Socket.IO adds handshakes and custom events; the HTTP routes above remain active.
   const io = new SocketIOServer(server, {
+    // Serve the browser client at /socket.io/socket.io.js.
     serveClient: true,
-    // Polling avoids requiring WebSocket upgrades on shared hosts.
+    // Force polling on client and server to avoid WebSocket-upgrade setup in shared-host proxies.
     transports: ["polling"],
     allowUpgrades: false,
     maxHttpBufferSize: 16 * 1024,
     cors: false,
     allowRequest: (req, callback) => {
+      // Same-origin checks limit browser origins, not user identity; io.use validates demo personas below.
       callback(null, isSameOriginRequest(req));
     },
   });
 
+  // Middleware runs on each handshake, before Socket.IO emits the connection event.
   io.use((socket, next) => {
-    // Demo identities select a persona; they do not authenticate a real user.
+    // This accepts a demo persona, not a real account or authenticated identity.
     const userId = socket.handshake.auth && socket.handshake.auth.userId;
     if (typeof userId !== "string" || !USERS_BY_ID.has(userId)) {
       next(new Error("Invalid demo user."));
       return;
     }
 
+    // Store the validated persona per socket. Ignore sender identity in event payloads.
     socket.data.userId = userId;
     next();
   });
@@ -179,6 +187,7 @@ function createDemoServer() {
     return {
       userId,
       users: USERS,
+      // Copy this persona's capped inbox to the new socket. History exists only in process memory.
       messages: historyFor(userId).slice(),
     };
   }
@@ -186,7 +195,7 @@ function createDemoServer() {
   function findMentionedUsers(message) {
     const recipientIds = [];
     const seen = new Set();
-    // Match complete Unicode handles so unknown mentions fail before routing can leak a message.
+    // Match complete Unicode handles. Unknown handles reject the whole send; they never become public broadcasts.
     const mentionPattern = /(?<![\p{L}\p{N}_@])@([\p{L}\p{N}_-]+)/gu;
     let match;
 
@@ -205,16 +214,16 @@ function createDemoServer() {
   }
 
   async function createChatItem({ senderId, kind, message, recipientIds, channel }) {
-    // Private audiences include the sender so every sender tab receives the same item.
+    // Store items in each audience user's inbox. Include sender so all their tabs stay in sync.
     const audienceIds = channel === "public"
       ? USERS.map((user) => user.id)
       : [...new Set([senderId, ...recipientIds])];
     const rooms = channel === "public"
       ? ["chat:all"]
       : audienceIds.map(userRoom);
+    // Count matching sockets for send-time metadata; this is not proof of delivery or reading.
     const matchedSockets = await io.in(rooms).fetchSockets();
     const matchedUserIds = new Set(matchedSockets.map((matchedSocket) => matchedSocket.data.userId));
-    // Online fields describe send-time routing eligibility, not delivery or reading.
     const onlineUserIds = audienceIds.filter((userId) => matchedUserIds.has(userId));
     const item = {
       id: crypto.randomUUID(),
@@ -247,7 +256,8 @@ function createDemoServer() {
       onlineUserIds: item.routing.onlineUserIds,
       onlineSocketCount: item.routing.onlineSocketCount,
     }));
-    // Socket.IO room arrays form a union, so each matching socket gets one event.
+    // Room arrays form a union, so overlapping rooms still emit once per socket.
+    // Private routes include sender's room so their other tabs receive the item.
     io.to(rooms).emit("chat:message", item);
     return item;
   }
@@ -261,6 +271,8 @@ function createDemoServer() {
     }
   }
 
+  // Acknowledgements are optional. Success means server acceptance, not client receipt or reading.
+  // Catch action failures here so they do not escape as unhandled promise rejections.
   async function handleAction(ack, action) {
     try {
       acknowledge(ack, await action());
@@ -270,14 +282,26 @@ function createDemoServer() {
     }
   }
 
+  // Serialize sends, pokes, and resets. Pending history lookups must finish before reset clears memory.
+  function enqueueAction(ack, action) {
+    actionQueue = actionQueue.then(() => handleAction(ack, action)).catch((error) => {
+      console.error("Socket.IO action queue failed", error);
+      acknowledge(ack, { ok: false, error: "Action failed." });
+    });
+  }
+
+  // socket.id is transient per connection; one selected demo userId can span tabs and reconnects.
   io.on("connection", (socket) => {
     const userId = socket.data.userId;
+    // Assign rooms server-side. Each socket joins the public room and its persona's private room.
     socket.join(["chat:all", userRoom(userId)]);
     console.log("Socket.IO connected", userId, socket.id);
+    // socket.emit sends only to this connection. Reconnects rerun middleware and receive a fresh snapshot.
     socket.emit("chat:state", snapshotFor(userId));
 
+    // socket.on registers a custom client event. Derive sender from socket.data.userId, not payload.
     socket.on("chat:send", (payload, ack) => {
-      void handleAction(ack, async () => {
+      enqueueAction(ack, async () => {
         if (!validPayload(payload, ["message"])) {
           return { ok: false, error: "Invalid chat payload." };
         }
@@ -293,6 +317,7 @@ function createDemoServer() {
         const mentions = findMentionedUsers(message);
         if (!mentions.ok) return mentions;
 
+        // Known mentions select private rooms; a message without mentions uses the public room.
         const channel = mentions.recipientIds.length > 0 ? "private" : "public";
         const item = await createChatItem({
           senderId: socket.data.userId,
@@ -305,8 +330,9 @@ function createDemoServer() {
       });
     });
 
+    // This event names a recipient only; sender still comes from socket.data.userId.
     socket.on("chat:poke", (payload, ack) => {
-      void handleAction(ack, async () => {
+      enqueueAction(ack, async () => {
         if (!validPayload(payload, ["recipientId"]) || typeof payload.recipientId !== "string") {
           return { ok: false, error: "Invalid poke payload." };
         }
@@ -328,6 +354,23 @@ function createDemoServer() {
       });
     });
 
+    // Any connected demo persona can reset all inboxes, including offline users. This is not an admin feature.
+    socket.on("chat:reset", (payload, ack) => {
+      enqueueAction(ack, async () => {
+        if (!validPayload(payload, [])) {
+          return { ok: false, error: "Invalid reset payload." };
+        }
+
+        // Reset is a control event, not a chat item. Never add it to history.
+        // io.emit notifies every connected socket. Reconnects show only post-reset messages.
+        for (const history of histories.values()) history.length = 0;
+        console.log("CHAT RESET", JSON.stringify({ by: userId }));
+        io.emit("chat:reset", { by: userId });
+        return { ok: true };
+      });
+    });
+
+    // Disconnect removes the socket, not history. Reconnects validate, rejoin rooms, and get a current snapshot.
     socket.on("disconnect", (reason) => {
       console.log("Socket.IO disconnected", userId, reason);
     });

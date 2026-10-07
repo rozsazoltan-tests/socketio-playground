@@ -14,7 +14,7 @@
     <header class="page-header">
       <div class="topline">
         <h1>Socket.IO chat test</h1>
-        <p>Status: <span id="status">connecting...</span> | Transport: <span id="transport">—</span></p>
+        <p><span id="connection-dot" class="connection-dot" aria-hidden="true"></span>Status: <span id="status" role="status" aria-live="polite">connecting...</span> | Transport: <span id="transport">—</span></p>
         <label for="identity">User: <select id="identity" disabled></select></label>
       </div>
       <div class="actions">
@@ -34,7 +34,11 @@
     </header>
     <div class="panels">
       <section class="panel" aria-labelledby="chat-heading">
-        <h2 id="chat-heading">Chat</h2>
+        <div class="panel-heading">
+          <h2 id="chat-heading">Chat</h2>
+          <button id="connection-toggle" type="button" disabled>Disconnect</button>
+          <button id="reset-chat" type="button" aria-label="Reset chat history for all demo users" title="Clear server history for all demo users" disabled>Reset chat</button>
+        </div>
         <ul id="chat" aria-label="Chat transcript"></ul>
       </section>
       <section class="panel" aria-labelledby="console-heading">

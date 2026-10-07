@@ -1,17 +1,21 @@
 (() => {
   const $ = (selector) => document.querySelector(selector);
   const identitySelect = $("#identity");
+  const connectionToggle = $("#connection-toggle");
+  const connectionDot = $("#connection-dot");
   const form = $("#chat-form");
   const messageInput = $("#message");
   const sendButton = $("#send-button");
   const pokeRecipient = $("#poke-recipient");
   const pokeButton = $("#poke-button");
+  const resetButton = $("#reset-chat");
   const chat = $("#chat");
   const logElement = $("#log");
   const toast = $("#toast");
   const soundNote = $("#sound-note");
   const users = new Map();
   const messages = new Map();
+  const connectionNotices = [];
   const loggedIds = new Set();
   const logLines = [];
   const activeSounds = new Set();
@@ -20,9 +24,12 @@
   let socket = null;
   let userId = null;
   let ready = false;
+  let manuallyDisconnected = false;
   let sending = false;
   let poking = false;
+  let resetting = false;
   let hasSnapshot = false;
+  let connectionNoticePending = false;
   let toastTimer = null;
   let audioContext = null;
   let audioUnlocking = false;
@@ -45,15 +52,20 @@
   }
 
   function canAct() {
-    return ready && Boolean(socket?.connected);
+    // A live transport is not usable until the server's authorized history snapshot has arrived.
+    return !manuallyDisconnected && ready && Boolean(socket?.connected);
   }
 
   function updateControls() {
     const enabled = canAct();
+    connectionToggle.textContent = manuallyDisconnected ? "Connect" : "Disconnect";
+    connectionToggle.disabled = !userId;
+    connectionDot.classList.toggle("connected", enabled);
     messageInput.disabled = !enabled;
-    sendButton.disabled = !enabled || sending || !messageInput.value.trim();
-    pokeRecipient.disabled = !enabled;
-    pokeButton.disabled = !enabled || poking || !pokeRecipient.value || pokeRecipient.value === userId;
+    sendButton.disabled = !enabled || sending || resetting || !messageInput.value.trim();
+    pokeRecipient.disabled = !enabled || resetting;
+    pokeButton.disabled = !enabled || poking || resetting || !pokeRecipient.value || pokeRecipient.value === userId;
+    resetButton.disabled = !enabled || resetting;
     for (const option of pokeRecipient.options) option.disabled = option.value === userId;
   }
 
@@ -92,6 +104,8 @@
 
   function clearChat() {
     messages.clear();
+    connectionNotices.length = 0;
+    loggedIds.clear();
     chat.replaceChildren();
     clearToast();
     stopSounds();
@@ -158,8 +172,8 @@
 
   function audienceText(item) {
     const routing = item.routing;
-    if (routing?.channel === "public") return "public";
-    if (routing?.channel === "private") return `private (${names(routing.audienceIds)})`;
+    if (routing?.channel === "public") return "Public";
+    if (routing?.channel === "private") return `Private · ${names(routing.audienceIds)}`;
     return "audience unknown";
   }
 
@@ -199,10 +213,23 @@
   function render(forceBottom = false) {
     const wasAtBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight <= 4;
     chat.replaceChildren();
-    const items = [...messages.values()].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
-    for (const item of items) {
+    const entries = [
+      ...[...messages.values()].map((item) => ({ time: Date.parse(item.createdAt), item })),
+      ...connectionNotices.map((notice) => ({ time: notice.time, notice })),
+    ].sort((left, right) => left.time - right.time);
+    for (const entry of entries) {
+      if (entry.notice) {
+        const row = document.createElement("li");
+        row.className = "chat-system";
+        row.textContent = entry.notice.text;
+        chat.append(row);
+        continue;
+      }
+      const item = entry.item;
       const row = document.createElement("li");
-      row.className = item.sender?.id === userId ? "chat-row own" : "chat-row";
+      const alignment = item.sender?.id === userId ? " own" : "";
+      const privacy = item.routing?.channel === "private" ? " private" : "";
+      row.className = `chat-row${alignment}${privacy}`;
       const time = new Date(item.createdAt);
       const stamp = Number.isNaN(time.getTime()) ? "time unknown" : time.toLocaleTimeString();
       const sender = item.sender?.name || userName(item.sender?.id);
@@ -221,6 +248,13 @@
     if (forceBottom || wasAtBottom) chat.scrollTop = chat.scrollHeight;
   }
 
+  // These local connection lines are not chat events and are never sent to other users.
+  function addConnectionNotice(text) {
+    connectionNotices.push({ time: Date.now(), text });
+    if (connectionNotices.length > 20) connectionNotices.shift();
+    render();
+  }
+
   function logItem(item) {
     if (!item?.id || loggedIds.has(item.id)) return;
     loggedIds.add(item.id);
@@ -229,6 +263,7 @@
   }
 
   function addItem(item, source) {
+    // Rooms are selected on the server; audienceIds only filter this display and are not authorization.
     const authorized = Array.isArray(item?.routing?.audienceIds) && item.routing.audienceIds.includes(userId);
     if (!item?.id || !item.sender?.id || !item.routing || !authorized || !["message", "poke"].includes(item.kind)) return false;
     // The acknowledgement and room echo can carry the same UUID.
@@ -255,9 +290,11 @@
     if (!canAct()) return;
     const requestSocket = socket;
     const requestUser = userId;
+    // Client .emit sends the event and payload; the server calls this callback to acknowledge it.
     requestSocket.timeout(8000).emit(event, payload, (timeoutError, result) => {
       if (socket !== requestSocket || userId !== requestUser) return;
       if (timeoutError) {
+        // A missing acknowledgement does not prove the server skipped the action; never retry automatically.
         const error = "Acknowledgement timed out; outcome unknown. Check chat after reconnect before retrying.";
         log(`${event}: ${error}`);
         onFailure(error);
@@ -271,21 +308,34 @@
     });
   }
 
-  function connectAs(nextUserId) {
+  function connectAs(nextUserId, preserveHistory = false) {
+    const identityChanged = userId !== nextUserId;
     userId = nextUserId;
     ready = false;
     sending = false;
     poking = false;
+    resetting = false;
     hasSnapshot = false;
-    clearChat();
-    clearLog();
+    connectionNoticePending = false;
+    if (!preserveHistory || identityChanged) {
+      clearChat();
+      clearLog();
+    }
     updateControls();
     if (socket) {
-      socket.removeAllListeners();
-      socket.disconnect();
+      const previousSocket = socket;
+      socket = null;
+      previousSocket.removeAllListeners();
+      previousSocket.disconnect();
+    }
+    if (manuallyDisconnected) {
+      setStatus("disconnected (manual)");
+      return;
     }
     setStatus("connecting...");
     const identityAtConnect = nextUserId;
+    // Event and acknowledgement handlers below capture this socket and identity, so replaced sessions cannot update the new one.
+    // This identity is a public demo selector, not authentication. Polling is the only transport.
     const nextSocket = window.io({
       transports: ["polling"],
       upgrade: false,
@@ -295,7 +345,10 @@
 
     nextSocket.on("connect", () => {
       if (socket !== nextSocket || userId !== identityAtConnect) return;
-      setStatus(ready ? "connected" : "connected; syncing chat...");
+      // Client connect confirms transport only; server connection also sends the chat snapshot.
+      ready = false;
+      connectionNoticePending = true;
+      setStatus("connected; syncing chat...");
       log(`OPEN user=${userName(identityAtConnect)} transport=${transportName()}`);
     });
     nextSocket.on("disconnect", (reason) => {
@@ -303,9 +356,17 @@
       ready = false;
       sending = false;
       poking = false;
-      setStatus("disconnected");
+      resetting = false;
+      connectionNoticePending = false;
+      if (reason === "io server disconnect") {
+        manuallyDisconnected = true;
+        setStatus("disconnected by server");
+      } else {
+        setStatus(`disconnected (${reason}); reconnecting...`);
+      }
       updateControls();
       log(`CLOSE reason=${reason}`);
+      addConnectionNotice(`Disconnected as ${userName(identityAtConnect)}.`);
     });
     nextSocket.on("connect_error", (error) => {
       if (socket !== nextSocket || userId !== identityAtConnect) return;
@@ -329,22 +390,56 @@
       const snapshotItems = state.messages.slice(-100).filter((item) => item?.id && Array.isArray(item?.routing?.audienceIds) && item.routing.audienceIds.includes(identityAtConnect));
       const snapshotIds = new Set(snapshotItems.map((item) => item.id));
       for (const id of loggedIds) if (!snapshotIds.has(id)) loggedIds.delete(id);
-      // Restored history stays quiet; only new live events trigger a toast or beep.
+      // The server sends only this user's retained history (up to 100); restoring it stays quiet.
+      // Routing audiences filter the transcript, but server-side room selection remains the access boundary.
       for (const item of snapshotItems) {
         messages.set(item.id, item);
         logItem(item);
       }
+      // Only a valid state snapshot enables actions; a transport-level connect is not enough.
       ready = true;
       const initialSnapshot = !hasSnapshot;
       hasSnapshot = true;
       render(initialSnapshot);
       setStatus("connected");
       log(`CHAT STATE messages=${messages.size}`);
+      if (connectionNoticePending) {
+        connectionNoticePending = false;
+        addConnectionNotice(`Connected as ${userName(identityAtConnect)}.`);
+      }
     });
     nextSocket.on("chat:message", (item) => {
+      // Socket .on handles server broadcasts; emit below sends actions from this client.
       if (socket !== nextSocket || userId !== identityAtConnect) return;
       addItem(item, "live");
     });
+    nextSocket.on("chat:reset", (event) => {
+      if (socket !== nextSocket || userId !== identityAtConnect) return;
+      // Reset is a server-wide broadcast; only this event clears history, not the local acknowledgement.
+      clearChat();
+      log(`RESET by=${userName(event?.by)}`);
+    });
+  }
+
+  function disconnectManually() {
+    if (!socket || manuallyDisconnected) return;
+    // Socket.disconnect stops this client's automatic reconnect until the user connects again.
+    manuallyDisconnected = true;
+    ready = false;
+    sending = false;
+    poking = false;
+    resetting = false;
+    connectionNoticePending = false;
+    const previousSocket = socket;
+    // Null first so late acknowledgements and manager events from this socket fail their identity guard.
+    socket = null;
+    previousSocket.removeAllListeners();
+    previousSocket.disconnect();
+    clearToast();
+    stopSounds();
+    setStatus("disconnected (manual)");
+    log(`MANUAL DISCONNECT user=${userName(userId)}`);
+    addConnectionNotice(`Disconnected as ${userName(userId)}.`);
   }
 
   function populateUsers(userList) {
@@ -371,6 +466,15 @@
     pokeRecipient.value = [...users.keys()].find((id) => id !== identitySelect.value) || "";
     connectAs(identitySelect.value);
   });
+  connectionToggle.addEventListener("click", () => {
+    if (!userId) return;
+    if (manuallyDisconnected) {
+      manuallyDisconnected = false;
+      connectAs(userId, true);
+    } else {
+      disconnectManually();
+    }
+  });
   messageInput.addEventListener("input", updateControls);
   messageInput.addEventListener("keydown", (event) => {
     // Enter can finish IME composition, so do not send while composition is active.
@@ -381,7 +485,7 @@
   pokeRecipient.addEventListener("change", updateControls);
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-    if (!canAct() || sending || !messageInput.value.trim()) return;
+    if (!canAct() || sending || resetting || !messageInput.value.trim()) return;
     const payload = { message: messageInput.value.trim() };
     sending = true;
     updateControls();
@@ -396,7 +500,7 @@
     });
   });
   pokeButton.addEventListener("click", () => {
-    if (!canAct() || poking || !pokeRecipient.value || pokeRecipient.value === userId) return;
+    if (!canAct() || poking || resetting || !pokeRecipient.value || pokeRecipient.value === userId) return;
     const payload = { recipientId: pokeRecipient.value };
     poking = true;
     updateControls();
@@ -406,6 +510,21 @@
       updateControls();
     }, () => {
       poking = false;
+      updateControls();
+    });
+  });
+  resetButton.addEventListener("click", () => {
+    if (!canAct() || resetting) return;
+    if (!window.confirm("Clear chat history for all demo users? This cannot be undone.")) return;
+    if (!canAct()) return;
+    resetting = true;
+    updateControls();
+    // The broadcast event clears chat; the acknowledgement only releases this tab's controls.
+    emit("chat:reset", {}, () => {
+      resetting = false;
+      updateControls();
+    }, () => {
+      resetting = false;
       updateControls();
     });
   });

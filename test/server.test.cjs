@@ -406,6 +406,229 @@ test("restores offline private history, excludes unauthorized history, and caps 
   });
 });
 
+test("resets every user's history and broadcasts once without disconnecting sockets", async () => {
+  await withDemo(async ({ demo, connect }) => {
+    const aliceOne = await connect("alice");
+    const aliceTwo = await connect("alice");
+    const bob = await connect("bob");
+    const carol = await connect("carol");
+
+    const publicBeforeReset = await emitAck(aliceOne.socket, "chat:send", { message: "Before reset" });
+    assertSuccess(publicBeforeReset);
+    const offlinePrivate = await emitAck(aliceOne.socket, "chat:send", { message: "Offline history @carol" });
+    assertSuccess(offlinePrivate);
+    carol.socket.disconnect();
+
+    const activeSockets = [aliceOne.socket, aliceTwo.socket, bob.socket];
+    const connectionIds = activeSockets.map((socket) => socket.id);
+    const roomSnapshots = activeSockets.map((socket) => {
+      const serverSocket = demo.io.sockets.sockets.get(socket.id);
+      assert.ok(serverSocket);
+      return [...serverSocket.rooms].sort();
+    });
+    const resetEvents = activeSockets.map((socket) => {
+      const events = [];
+      socket.on("chat:reset", (event) => events.push(event));
+      return events;
+    });
+    const resetWaiters = activeSockets.map((socket) => waitForEvent(socket, "chat:reset"));
+    const reset = await emitAck(bob.socket, "chat:reset", {});
+
+    assert.deepEqual(reset, { ok: true });
+    assert.deepEqual(await Promise.all(resetWaiters), activeSockets.map(() => ({ by: "bob" })));
+    assert.deepEqual(resetEvents, activeSockets.map(() => [{ by: "bob" }]));
+    activeSockets.forEach((socket, index) => {
+      assert.equal(socket.connected, true);
+      assert.equal(socket.id, connectionIds[index]);
+      const serverSocket = demo.io.sockets.sockets.get(socket.id);
+      assert.deepEqual([...serverSocket.rooms].sort(), roomSnapshots[index]);
+    });
+
+    const afterReset = [];
+    for (const userId of ["alice", "bob", "carol"]) {
+      afterReset.push([userId, await connect(userId)]);
+    }
+    assert.deepEqual(afterReset.map(([, connection]) => connection.state.messages), [[], [], []]);
+
+    const connectedByUser = [
+      ["alice", aliceOne.socket],
+      ["alice", aliceTwo.socket],
+      ["bob", bob.socket],
+      ...afterReset.map(([userId, connection]) => [userId, connection.socket]),
+    ];
+    const receivedBySocket = connectedByUser.map(([userId, socket]) => [userId, watchMessages(socket)]);
+
+    const publicWaiters = connectedByUser.map(([, socket]) => waitForEvent(socket, "chat:message"));
+    const publicResult = await emitAck(aliceOne.socket, "chat:send", { message: "Public after reset" });
+    assertSuccess(publicResult);
+    for (const event of await Promise.all(publicWaiters)) assert.equal(event.id, publicResult.item.id);
+
+    const privateWaiters = connectedByUser
+      .filter(([userId]) => userId === "alice" || userId === "bob")
+      .map(([, socket]) => waitForEvent(socket, "chat:message"));
+    const privateResult = await emitAck(aliceOne.socket, "chat:send", { message: "Private after reset @bob" });
+    assertSuccess(privateResult);
+    for (const event of await Promise.all(privateWaiters)) assert.equal(event.id, privateResult.item.id);
+
+    const pokeWaiters = connectedByUser
+      .filter(([userId]) => userId === "alice" || userId === "bob")
+      .map(([, socket]) => waitForEvent(socket, "chat:message"));
+    const pokeResult = await emitAck(aliceOne.socket, "chat:poke", { recipientId: "bob" });
+    assertSuccess(pokeResult);
+    for (const event of await Promise.all(pokeWaiters)) assert.equal(event.id, pokeResult.item.id);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    for (const [userId, socketMessages] of receivedBySocket) {
+      const expectedIds = userId === "carol"
+        ? [publicResult.item.id]
+        : [publicResult.item.id, privateResult.item.id, pokeResult.item.id];
+      assert.deepEqual(socketMessages.map((item) => item.id), expectedIds);
+    }
+
+    for (const userId of ["alice", "bob", "carol"]) {
+      const reconnect = await connect(userId);
+      const expectedIds = userId === "carol"
+        ? [publicResult.item.id]
+        : [publicResult.item.id, privateResult.item.id, pokeResult.item.id];
+      assert.deepEqual(reconnect.state.messages.map((item) => item.id), expectedIds);
+      assert.ok(reconnect.state.messages.every((item) => item.id !== offlinePrivate.item.id));
+      assert.ok(reconnect.state.messages.every((item) => item.kind !== "reset"));
+    }
+  });
+});
+
+test("rejects invalid reset payloads without clearing history or broadcasting", async () => {
+  await withDemo(async ({ connect }) => {
+    const alice = await connect("alice");
+    const bob = await connect("bob");
+    const existing = await emitAck(alice.socket, "chat:send", { message: "Keep this history" });
+    assertSuccess(existing);
+
+    const resetEvents = [alice.socket, bob.socket].map((socket) => {
+      const events = [];
+      socket.on("chat:reset", (event) => events.push(event));
+      return events;
+    });
+    for (const payload of [null, [], { unexpected: true }]) {
+      assert.deepEqual(await emitAck(alice.socket, "chat:reset", payload), {
+        ok: false,
+        error: "Invalid reset payload.",
+      });
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(resetEvents, [[], []]);
+    for (const userId of ["alice", "bob", "carol"]) {
+      const reconnect = await connect(userId);
+      assert.deepEqual(reconnect.state.messages.map((item) => item.id), [existing.item.id]);
+    }
+  });
+});
+
+test("runs reset after an in-flight send and prevents stale history from returning", async () => {
+  await withDemo(async ({ demo, connect }) => {
+    const alice = await connect("alice");
+    const bob = await connect("bob");
+    const originalIn = demo.io.in;
+    let resolveFetchStarted;
+    let releaseFetch;
+    const fetchStarted = new Promise((resolve) => { resolveFetchStarted = resolve; });
+    const fetchGate = new Promise((resolve) => { releaseFetch = resolve; });
+    let delayNextFetch = true;
+    demo.io.in = (...rooms) => {
+      const operator = originalIn.apply(demo.io, rooms);
+      if (delayNextFetch) {
+        delayNextFetch = false;
+        const fetchSockets = operator.fetchSockets.bind(operator);
+        operator.fetchSockets = async () => {
+          resolveFetchStarted();
+          await fetchGate;
+          return fetchSockets();
+        };
+      }
+      return operator;
+    };
+
+    const aliceEvents = [];
+    const bobEvents = [];
+    for (const [socket, events] of [[alice.socket, aliceEvents], [bob.socket, bobEvents]]) {
+      socket.on("chat:message", (item) => events.push(["message", item.id]));
+      socket.on("chat:reset", (event) => events.push(["reset", event.by]));
+    }
+
+    try {
+      const serverAlice = demo.io.sockets.sockets.get(alice.socket.id);
+      const resetReceived = waitForEvent(serverAlice, "chat:reset");
+      const sendPromise = emitAck(alice.socket, "chat:send", { message: "Pending before reset" });
+      await fetchStarted;
+      const resetPromise = emitAck(alice.socket, "chat:reset", {});
+      await resetReceived;
+      releaseFetch();
+
+      const [sendResult, resetResult] = await Promise.all([sendPromise, resetPromise]);
+      assertSuccess(sendResult);
+      assert.deepEqual(resetResult, { ok: true });
+      assert.deepEqual(aliceEvents, [["message", sendResult.item.id], ["reset", "alice"]]);
+      assert.deepEqual(bobEvents, [["message", sendResult.item.id], ["reset", "alice"]]);
+      for (const userId of ["alice", "bob", "carol"]) {
+        const reconnect = await connect(userId);
+        assert.deepEqual(reconnect.state.messages, []);
+      }
+    } finally {
+      releaseFetch();
+      demo.io.in = originalIn;
+    }
+  });
+});
+
+test("continues queued actions after an action fails", async () => {
+  await withDemo(async ({ demo, connect }) => {
+    const alice = await connect("alice");
+    const bob = await connect("bob");
+    const originalIn = demo.io.in;
+    const originalError = console.error;
+    const loggedErrors = [];
+    let failNextFetch = true;
+    demo.io.in = (...rooms) => {
+      const operator = originalIn.apply(demo.io, rooms);
+      if (failNextFetch) {
+        failNextFetch = false;
+        operator.fetchSockets = async () => { throw new Error("controlled fetch failure"); };
+      }
+      return operator;
+    };
+    console.error = (...args) => loggedErrors.push(args);
+
+    try {
+      const aliceMessages = watchMessages(alice.socket);
+      const bobMessages = watchMessages(bob.socket);
+      const resetEvent = waitForEvent(alice.socket, "chat:reset");
+      const failedAction = emitAck(alice.socket, "chat:send", { message: "Must not persist" });
+      const resetAction = emitAck(alice.socket, "chat:reset", {});
+      const recoveredEvents = [alice.socket, bob.socket].map((socket) => waitForEvent(socket, "chat:message"));
+      const recoveredAction = emitAck(alice.socket, "chat:send", { message: "After recovery" });
+
+      assert.deepEqual(await failedAction, { ok: false, error: "Action failed." });
+      assert.deepEqual(await resetAction, { ok: true });
+      assert.deepEqual(await resetEvent, { by: "alice" });
+      const recovered = await recoveredAction;
+      assertSuccess(recovered);
+      for (const event of await Promise.all(recoveredEvents)) assert.equal(event.id, recovered.item.id);
+      assert.deepEqual(aliceMessages.map((item) => item.id), [recovered.item.id]);
+      assert.deepEqual(bobMessages.map((item) => item.id), [recovered.item.id]);
+      assert.equal(loggedErrors.filter(([message]) => message === "Socket.IO action failed").length, 1);
+
+      for (const userId of ["alice", "bob", "carol"]) {
+        const reconnect = await connect(userId);
+        assert.deepEqual(reconnect.state.messages.map((item) => item.id), [recovered.item.id]);
+      }
+    } finally {
+      demo.io.in = originalIn;
+      console.error = originalError;
+    }
+  });
+});
+
 test("preserves demo identity validation and same-origin handshake checks", async () => {
   await withDemo(async ({ url, sockets }) => {
     const invalidUser = createClient(url, {
