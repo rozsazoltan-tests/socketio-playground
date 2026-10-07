@@ -1,0 +1,19 @@
+{
+  "name": "socketio-playground",
+  "version": "1.0.0",
+  "description": "A polling-based Socket.IO chat demo with private mentions and Markdown.",
+  "private": true,
+  "license": "MIT",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node app.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "markdown-it": "15.0.2",
+    "socket.io": "4.8.4"
+  },
+  "devDependencies": {
+    "socket.io-client": "4.8.4"
+  }
+}

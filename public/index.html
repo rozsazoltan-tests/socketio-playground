@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Socket.IO chat test</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./socket.io/socket.io.js" defer></script>
+  <script src="./markdown-it.js" defer></script>
+  <script src="./demo.js" defer></script>
+</head>
+<body>
+  <main id="app">
+    <header class="page-header">
+      <div class="topline">
+        <h1>Socket.IO chat test</h1>
+        <p>Status: <span id="status">connecting...</span> | Transport: <span id="transport">—</span></p>
+        <label for="identity">User: <select id="identity" disabled></select></label>
+      </div>
+      <div class="actions">
+        <form id="chat-form">
+          <label for="message">Message:</label>
+          <textarea id="message" rows="2" maxlength="280" autocomplete="off" required disabled></textarea>
+          <button id="send-button" type="submit" disabled>Send</button>
+        </form>
+        <p class="markdown-hint">Markdown: **bold**, `code`. Enter sends; Shift+Enter adds a line.</p>
+        <p class="poke-control"><label for="poke-recipient">Poke:</label> <select id="poke-recipient" disabled></select> <button id="poke-button" type="button" disabled>Poke</button></p>
+      </div>
+      <div class="notes">
+        <p>Open two tabs as different users; add @bob for a private message, or omit mentions to broadcast.</p>
+        <p>Demo identities have no authentication. History stays in server memory and clears on restart.</p>
+        <p id="sound-note">Click or press a key to enable notification sound.</p>
+      </div>
+    </header>
+    <div class="panels">
+      <section class="panel" aria-labelledby="chat-heading">
+        <h2 id="chat-heading">Chat</h2>
+        <ul id="chat" aria-label="Chat transcript"></ul>
+      </section>
+      <section class="panel" aria-labelledby="console-heading">
+        <div class="panel-heading">
+          <h2 id="console-heading">Console</h2>
+          <button id="clear-log" type="button">Clear log</button>
+        </div>
+        <pre id="log" aria-label="Technical log"></pre>
+      </section>
+    </div>
+  </main>
+  <div id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
