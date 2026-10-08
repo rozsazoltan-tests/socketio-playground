@@ -31,6 +31,12 @@ function watchMessages(socket) {
   return messages;
 }
 
+function waitForServerDisconnect(demo, clientSocket) {
+  const serverSocket = demo.io.sockets.sockets.get(clientSocket.id);
+  assert.ok(serverSocket, "server socket should still exist before disconnect");
+  return waitForEvent(serverSocket, "disconnect");
+}
+
 function assertCanonicalItem(item) {
   assert.deepEqual(Object.keys(item).sort(), [
     "createdAt",
@@ -53,6 +59,15 @@ function assertCanonicalItem(item) {
   ]);
 }
 
+function assertCanonicalPresence(event, user, state) {
+  assert.deepEqual(Object.keys(event).sort(), ["createdAt", "state", "user"]);
+  assert.deepEqual(event.user, user);
+  assert.deepEqual(Object.keys(event.user).sort(), ["id", "name"]);
+  assert.equal(event.state, state);
+  assert.ok(Number.isFinite(Date.parse(event.createdAt)));
+  assert.equal(new Date(event.createdAt).toISOString(), event.createdAt);
+}
+
 async function startDemo() {
   const demo = createDemoServer();
   await new Promise((resolve, reject) => {
@@ -73,7 +88,7 @@ async function withDemo(run) {
   const { demo, url } = await startDemo();
   const sockets = [];
 
-  async function connect(userId) {
+  async function connect(userId, beforeConnect) {
     const socket = createClient(url, {
       auth: { userId },
       transports: ["polling"],
@@ -82,6 +97,7 @@ async function withDemo(run) {
       timeout: 4000,
     });
     sockets.push(socket);
+    if (typeof beforeConnect === "function") beforeConnect(socket);
     const statePromise = waitForEvent(socket, "chat:state");
     await new Promise((resolve, reject) => {
       socket.once("connect", resolve);
@@ -559,6 +575,8 @@ test("runs reset after an in-flight send and prevents stale history from returni
     try {
       const serverAlice = demo.io.sockets.sockets.get(alice.socket.id);
       const resetReceived = waitForEvent(serverAlice, "chat:reset");
+      const aliceResetEvent = waitForEvent(alice.socket, "chat:reset");
+      const bobResetEvent = waitForEvent(bob.socket, "chat:reset");
       const sendPromise = emitAck(alice.socket, "chat:send", { message: "Pending before reset" });
       await fetchStarted;
       const resetPromise = emitAck(alice.socket, "chat:reset", {});
@@ -568,6 +586,7 @@ test("runs reset after an in-flight send and prevents stale history from returni
       const [sendResult, resetResult] = await Promise.all([sendPromise, resetPromise]);
       assertSuccess(sendResult);
       assert.deepEqual(resetResult, { ok: true });
+      assert.deepEqual(await Promise.all([aliceResetEvent, bobResetEvent]), [{ by: "alice" }, { by: "alice" }]);
       assert.deepEqual(aliceEvents, [["message", sendResult.item.id], ["reset", "alice"]]);
       assert.deepEqual(bobEvents, [["message", sendResult.item.id], ["reset", "alice"]]);
       for (const userId of ["alice", "bob", "carol"]) {
@@ -626,6 +645,291 @@ test("continues queued actions after an action fails", async () => {
       demo.io.in = originalIn;
       console.error = originalError;
     }
+  });
+});
+
+test("broadcasts first and last socket presence transitions without storing them", async () => {
+  await withDemo(async ({ demo, connect }) => {
+    let aliceOwnPresence;
+    const alice = await connect("alice", (socket) => {
+      aliceOwnPresence = waitForEvent(socket, "chat:presence");
+    });
+    assertCanonicalPresence(await aliceOwnPresence, { id: "alice", name: "Alice" }, "connected");
+    const alicePresenceEvents = [];
+    alice.socket.on("chat:presence", (event) => alicePresenceEvents.push(event));
+
+    const aliceSawBobOnline = waitForEvent(alice.socket, "chat:presence");
+    let bobOneOwnPresence;
+    const bobOnePresenceEvents = [];
+    const bobOne = await connect("bob", (socket) => {
+      socket.on("chat:presence", (event) => bobOnePresenceEvents.push(event));
+      bobOneOwnPresence = waitForEvent(socket, "chat:presence");
+    });
+    const bobOnline = await aliceSawBobOnline;
+    assertCanonicalPresence(bobOnline, { id: "bob", name: "Bob" }, "connected");
+    assert.deepEqual(await bobOneOwnPresence, bobOnline);
+
+    const bobTwoPresenceEvents = [];
+    const bobTwo = await connect("bob", (socket) => {
+      socket.on("chat:presence", (event) => bobTwoPresenceEvents.push(event));
+    });
+    assert.deepEqual(bobTwo.state.messages, []);
+
+    const carolWaiters = [alice.socket, bobOne.socket, bobTwo.socket]
+      .map((socket) => waitForEvent(socket, "chat:presence"));
+    let carolOwnPresence;
+    const carolPresenceEvents = [];
+    const carol = await connect("carol", (socket) => {
+      socket.on("chat:presence", (event) => carolPresenceEvents.push(event));
+      carolOwnPresence = waitForEvent(socket, "chat:presence");
+    });
+    const carolOnlineEvents = await Promise.all(carolWaiters);
+    const carolOnline = carolOnlineEvents[0];
+    assertCanonicalPresence(carolOnline, { id: "carol", name: "Carol" }, "connected");
+    for (const event of carolOnlineEvents) assert.deepEqual(event, carolOnline);
+    assert.deepEqual(await carolOwnPresence, carolOnline);
+    assert.deepEqual(alicePresenceEvents, [bobOnline, carolOnline]);
+    assert.deepEqual(bobOnePresenceEvents, [bobOnline, carolOnline]);
+    assert.deepEqual(bobTwoPresenceEvents, [carolOnline]);
+    assert.deepEqual(carolPresenceEvents, [carolOnline]);
+
+    const bobOneDisconnected = waitForServerDisconnect(demo, bobOne.socket);
+    bobOne.socket.disconnect();
+    await bobOneDisconnected;
+
+    const carolOfflineWaiters = [alice.socket, bobTwo.socket]
+      .map((socket) => waitForEvent(socket, "chat:presence"));
+    const carolDisconnected = waitForServerDisconnect(demo, carol.socket);
+    carol.socket.disconnect();
+    await carolDisconnected;
+    const carolOfflineEvents = await Promise.all(carolOfflineWaiters);
+    const carolOffline = carolOfflineEvents[0];
+    assertCanonicalPresence(carolOffline, { id: "carol", name: "Carol" }, "disconnected");
+    for (const event of carolOfflineEvents) assert.deepEqual(event, carolOffline);
+    assert.deepEqual(alicePresenceEvents, [bobOnline, carolOnline, carolOffline]);
+    assert.deepEqual(bobTwoPresenceEvents, [carolOnline, carolOffline]);
+
+    const bobOfflineWaiter = waitForEvent(alice.socket, "chat:presence");
+    const bobTwoDisconnected = waitForServerDisconnect(demo, bobTwo.socket);
+    bobTwo.socket.disconnect();
+    await bobTwoDisconnected;
+    const bobOffline = await bobOfflineWaiter;
+    assertCanonicalPresence(bobOffline, { id: "bob", name: "Bob" }, "disconnected");
+    assert.deepEqual(alicePresenceEvents, [bobOnline, carolOnline, carolOffline, bobOffline]);
+
+    const aliceReconnect = await connect("alice");
+    assert.deepEqual(aliceReconnect.state.messages, []);
+    const aliceReconnectPresence = waitForEvent(aliceReconnect.socket, "chat:presence");
+    const bobSawReconnect = waitForEvent(alice.socket, "chat:presence");
+    let bobReconnectOwnPresence;
+    const bobReconnect = await connect("bob", (socket) => {
+      bobReconnectOwnPresence = waitForEvent(socket, "chat:presence");
+    });
+    assert.deepEqual(bobReconnect.state.messages, []);
+    const bobReconnected = await bobSawReconnect;
+    assertCanonicalPresence(bobReconnected, { id: "bob", name: "Bob" }, "connected");
+    assert.deepEqual(await aliceReconnectPresence, bobReconnected);
+    assert.deepEqual(await bobReconnectOwnPresence, bobReconnected);
+    assert.deepEqual(alicePresenceEvents, [bobOnline, carolOnline, carolOffline, bobOffline, bobReconnected]);
+  });
+});
+
+test("reset clears histories without changing active presence counts", async () => {
+  await withDemo(async ({ demo, connect }) => {
+    let aliceOwnPresence;
+    const alice = await connect("alice", (socket) => {
+      aliceOwnPresence = waitForEvent(socket, "chat:presence");
+    });
+    await aliceOwnPresence;
+    const alicePresenceEvents = [];
+    alice.socket.on("chat:presence", (event) => alicePresenceEvents.push(event));
+
+    const aliceSawBob = waitForEvent(alice.socket, "chat:presence");
+    const bobOnePresenceEvents = [];
+    const bobOne = await connect("bob", (socket) => {
+      socket.on("chat:presence", (event) => bobOnePresenceEvents.push(event));
+    });
+    const bobOnline = await aliceSawBob;
+    assertCanonicalPresence(bobOnline, { id: "bob", name: "Bob" }, "connected");
+
+    const seeded = await emitAck(alice.socket, "chat:send", { message: "Will be cleared" });
+    assertSuccess(seeded);
+    assert.deepEqual(await emitAck(alice.socket, "chat:reset", {}), { ok: true });
+    assert.equal(alice.socket.connected, true);
+    assert.equal(bobOne.socket.connected, true);
+
+    const bobTwoPresenceEvents = [];
+    const bobTwo = await connect("bob", (socket) => {
+      socket.on("chat:presence", (event) => bobTwoPresenceEvents.push(event));
+    });
+    assert.deepEqual(bobTwo.state.messages, []);
+
+    const carolWaiters = [alice.socket, bobOne.socket, bobTwo.socket]
+      .map((socket) => waitForEvent(socket, "chat:presence"));
+    const carolPresenceEvents = [];
+    let carolOwnPresence;
+    const carol = await connect("carol", (socket) => {
+      socket.on("chat:presence", (event) => carolPresenceEvents.push(event));
+      carolOwnPresence = waitForEvent(socket, "chat:presence");
+    });
+    const carolOnlineEvents = await Promise.all(carolWaiters);
+    const carolOnline = carolOnlineEvents[0];
+    assertCanonicalPresence(carolOnline, { id: "carol", name: "Carol" }, "connected");
+    for (const event of carolOnlineEvents) assert.deepEqual(event, carolOnline);
+    assert.deepEqual(await carolOwnPresence, carolOnline);
+    assert.deepEqual(alicePresenceEvents, [bobOnline, carolOnline]);
+    assert.deepEqual(bobOnePresenceEvents, [bobOnline, carolOnline]);
+    assert.deepEqual(bobTwoPresenceEvents, [carolOnline]);
+    assert.deepEqual(carolPresenceEvents, [carolOnline]);
+    assert.deepEqual(carol.state.messages, []);
+
+    const bobOneDisconnected = waitForServerDisconnect(demo, bobOne.socket);
+    bobOne.socket.disconnect();
+    await bobOneDisconnected;
+    const carolOfflineWaiters = [alice.socket, bobTwo.socket]
+      .map((socket) => waitForEvent(socket, "chat:presence"));
+    const carolDisconnected = waitForServerDisconnect(demo, carol.socket);
+    carol.socket.disconnect();
+    await carolDisconnected;
+    const carolOfflineEvents = await Promise.all(carolOfflineWaiters);
+    const carolOffline = carolOfflineEvents[0];
+    assertCanonicalPresence(carolOffline, { id: "carol", name: "Carol" }, "disconnected");
+    for (const event of carolOfflineEvents) assert.deepEqual(event, carolOffline);
+    assert.deepEqual(alicePresenceEvents, [bobOnline, carolOnline, carolOffline]);
+    assert.deepEqual(bobTwoPresenceEvents, [carolOnline, carolOffline]);
+
+    const bobOfflineWaiter = waitForEvent(alice.socket, "chat:presence");
+    const bobTwoDisconnected = waitForServerDisconnect(demo, bobTwo.socket);
+    bobTwo.socket.disconnect();
+    await bobTwoDisconnected;
+    const bobOffline = await bobOfflineWaiter;
+    assertCanonicalPresence(bobOffline, { id: "bob", name: "Bob" }, "disconnected");
+    assert.deepEqual(alicePresenceEvents, [bobOnline, carolOnline, carolOffline, bobOffline]);
+
+    const aliceReconnect = await connect("alice");
+    assert.deepEqual(aliceReconnect.state.messages, []);
+  });
+});
+
+test("rejects presence from failed handshakes and ignores client presence events", async () => {
+  await withDemo(async ({ connect, url, sockets }) => {
+    let aliceOwnPresence;
+    const alice = await connect("alice", (socket) => {
+      aliceOwnPresence = waitForEvent(socket, "chat:presence");
+    });
+    await aliceOwnPresence;
+    const alicePresenceEvents = [];
+    alice.socket.on("chat:presence", (event) => alicePresenceEvents.push(event));
+
+    const invalidUser = createClient(url, {
+      auth: { userId: "mallory" },
+      transports: ["polling"],
+      upgrade: false,
+      reconnection: false,
+      timeout: 3000,
+    });
+    sockets.push(invalidUser);
+    const invalidUserError = waitForEvent(invalidUser, "connect_error");
+
+    const crossOrigin = createClient(url, {
+      auth: { userId: "bob" },
+      transports: ["polling"],
+      upgrade: false,
+      reconnection: false,
+      timeout: 3000,
+      extraHeaders: { Origin: "https://attacker.invalid" },
+    });
+    sockets.push(crossOrigin);
+    const crossOriginError = waitForEvent(crossOrigin, "connect_error");
+    await Promise.all([invalidUserError, crossOriginError]);
+
+    const aliceSawBob = waitForEvent(alice.socket, "chat:presence");
+    let bobOwnPresence;
+    const bobPresenceEvents = [];
+    const bob = await connect("bob", (socket) => {
+      socket.on("chat:presence", (event) => bobPresenceEvents.push(event));
+      bobOwnPresence = waitForEvent(socket, "chat:presence");
+    });
+    const bobOnline = await aliceSawBob;
+    assertCanonicalPresence(bobOnline, { id: "bob", name: "Bob" }, "connected");
+    assert.deepEqual(await bobOwnPresence, bobOnline);
+    assert.deepEqual(alicePresenceEvents, [bobOnline]);
+    assert.deepEqual(bobPresenceEvents, [bobOnline]);
+
+    const aliceSawMessage = waitForEvent(alice.socket, "chat:message");
+    const bobSawMessage = waitForEvent(bob.socket, "chat:message");
+    bob.socket.emit("chat:presence", {
+      user: { id: "carol", name: "Carol" },
+      state: "connected",
+      createdAt: new Date().toISOString(),
+    });
+    const barrier = await emitAck(bob.socket, "chat:send", { message: "No presence event" });
+    assertSuccess(barrier);
+    await Promise.all([aliceSawMessage, bobSawMessage]);
+    assert.deepEqual(alicePresenceEvents, [bobOnline]);
+    assert.deepEqual(bobPresenceEvents, [bobOnline]);
+  });
+});
+
+test("reports offline and online transitions when a demo persona changes or reconnects", async () => {
+  await withDemo(async ({ demo, connect }) => {
+    let observerOwnPresence;
+    const observerEvents = [];
+    const observer = await connect("bob", (socket) => {
+      socket.on("chat:presence", (event) => observerEvents.push(event));
+      observerOwnPresence = waitForEvent(socket, "chat:presence");
+    });
+    assertCanonicalPresence(await observerOwnPresence, { id: "bob", name: "Bob" }, "connected");
+
+    const observerSawAlice = waitForEvent(observer.socket, "chat:presence");
+    let aliceOwnPresence;
+    const alice = await connect("alice", (socket) => {
+      aliceOwnPresence = waitForEvent(socket, "chat:presence");
+    });
+    const aliceOnline = await observerSawAlice;
+    assertCanonicalPresence(aliceOnline, { id: "alice", name: "Alice" }, "connected");
+    assert.deepEqual(await aliceOwnPresence, aliceOnline);
+
+    const aliceOfflineWaiter = waitForEvent(observer.socket, "chat:presence");
+    const aliceDisconnected = waitForServerDisconnect(demo, alice.socket);
+    demo.io.sockets.sockets.get(alice.socket.id).disconnect(true);
+    await aliceDisconnected;
+    const aliceOffline = await aliceOfflineWaiter;
+    assertCanonicalPresence(aliceOffline, { id: "alice", name: "Alice" }, "disconnected");
+
+    const observerSawCarol = waitForEvent(observer.socket, "chat:presence");
+    let carolOwnPresence;
+    const carol = await connect("carol", (socket) => {
+      carolOwnPresence = waitForEvent(socket, "chat:presence");
+    });
+    const carolOnline = await observerSawCarol;
+    assertCanonicalPresence(carolOnline, { id: "carol", name: "Carol" }, "connected");
+    assert.deepEqual(await carolOwnPresence, carolOnline);
+
+    const carolOfflineWaiter = waitForEvent(observer.socket, "chat:presence");
+    const carolDisconnected = waitForServerDisconnect(demo, carol.socket);
+    carol.socket.disconnect();
+    await carolDisconnected;
+    const carolOffline = await carolOfflineWaiter;
+    assertCanonicalPresence(carolOffline, { id: "carol", name: "Carol" }, "disconnected");
+
+    const observerSawAliceAgain = waitForEvent(observer.socket, "chat:presence");
+    let aliceReconnectOwnPresence;
+    const aliceReconnect = await connect("alice", (socket) => {
+      aliceReconnectOwnPresence = waitForEvent(socket, "chat:presence");
+    });
+    const aliceReconnected = await observerSawAliceAgain;
+    assertCanonicalPresence(aliceReconnected, { id: "alice", name: "Alice" }, "connected");
+    assert.deepEqual(await aliceReconnectOwnPresence, aliceReconnected);
+    assert.deepEqual(aliceReconnect.state.messages, []);
+    assert.deepEqual(observerEvents, [
+      { user: { id: "bob", name: "Bob" }, state: "connected", createdAt: observerEvents[0].createdAt },
+      aliceOnline,
+      aliceOffline,
+      carolOnline,
+      carolOffline,
+      aliceReconnected,
+    ]);
   });
 });
 

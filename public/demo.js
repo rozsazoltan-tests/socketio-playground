@@ -248,9 +248,9 @@
     if (forceBottom || wasAtBottom) chat.scrollTop = chat.scrollHeight;
   }
 
-  // These local connection lines are not chat events and are never sent to other users.
-  function addConnectionNotice(text) {
-    connectionNotices.push({ time: Date.now(), text });
+  // Local notices and live presence share this bounded display list; neither becomes chat history.
+  function addConnectionNotice(text, time = Date.now()) {
+    connectionNotices.push({ time, text });
     if (connectionNotices.length > 20) connectionNotices.shift();
     render();
   }
@@ -418,6 +418,18 @@
       // Reset is a server-wide broadcast; only this event clears history, not the local acknowledgement.
       clearChat();
       log(`RESET by=${userName(event?.by)}`);
+    });
+    nextSocket.on("chat:presence", (presence) => {
+      if (socket !== nextSocket || userId !== identityAtConnect) return;
+      const personId = presence?.user?.id;
+      const timestamp = typeof presence?.createdAt === "string" ? Date.parse(presence.createdAt) : NaN;
+      if (personId === identityAtConnect || !users.has(personId)) return;
+      if (presence.state !== "connected" && presence.state !== "disconnected") return;
+      if (!Number.isFinite(timestamp)) return;
+      // Ignore this identity: its local socket notices already describe its own connection lifecycle.
+      const name = userName(personId);
+      addConnectionNotice(`${name} ${presence.state}.`, timestamp);
+      log(`PRESENCE user=${personId} state=${presence.state}`);
     });
   }
 

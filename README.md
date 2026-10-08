@@ -152,7 +152,28 @@ socket.on("chat:message", (item) => {
 
 On connection, the browser replaces its transcript with the snapshot and enables actions after synchronization. Restored items do not produce notifications. A temporary transport failure normally triggers automatic reconnection. Calling `socket.disconnect()` deliberately stops those retries; `socket.connect()` opens the connection again. A new snapshot restores only eligible retained items, not a durable archive.
 
-In the demo, **Disconnect** pauses the current tab without deleting its transcript or draft. **Connect** creates a fresh socket for the selected user and waits for its snapshot. Changing users while paused does not reconnect. The status dot stays red until both the connection and snapshot are ready, then turns green. Small gray connection lines belong only to this tab: they are not broadcast to other users or stored on the server. Reset and identity changes clear those lines too.
+In the demo, **Disconnect** pauses the current tab without deleting its transcript or draft. **Connect** creates a fresh socket for the selected user and waits for its snapshot. Changing users while paused does not reconnect. The status dot stays red until both the connection and snapshot are ready, then turns green; it describes only this tab's session. Your own `Connected as Alice.` and `Disconnected as Alice.` lines stay local. Other users' `Bob connected.` or `Bob disconnected.` lines arrive through server `chat:presence` events: `{ user: { id, name }, state, createdAt }`, where `state` is `"connected"` or `"disconnected"` and `createdAt` is an ISO timestamp. This shortened receiver belongs inside the existing `connectAs()` function:
+
+```js
+nextSocket.on("chat:presence", (presence) => {
+  if (socket !== nextSocket || userId !== identityAtConnect) return;
+  const personId = presence?.user?.id;
+  const timestamp = typeof presence?.createdAt === "string" ? Date.parse(presence.createdAt) : NaN;
+  if (personId === identityAtConnect || !users.has(personId)) return;
+  if (presence.state !== "connected" && presence.state !== "disconnected") return;
+  if (!Number.isFinite(timestamp)) return;
+  // Use the known name; the existing helper renders plain text, not HTML.
+  addConnectionNotice(`${users.get(personId)} ${presence.state}.`, timestamp);
+});
+```
+
+The server announces a user's first connection after its initial snapshot and their departure only after it observes the last socket disconnect. Closing one of two Bob tabs does not announce Bob leaving; reconnecting after the last socket is lost announces a fresh arrival. The server derives these transitions from accepted connections, not client presence payloads. Presence shares the bounded 20-notice view with local connection lines, ordered by timestamp, without a toast or beep. It is live, not an online roster, chat history, or proof of attention or delivery; missed events are not replayed. Reset and identity changes clear the local notices. Reset leaves active connections and presence tracking intact, without fake departures or arrivals.
+
+Clicking **Disconnect** calls [`socket.disconnect()`](https://socket.io/docs/v4/client-api/), which sends a Socket.IO namespace `DISCONNECT` packet and stops automatic reconnection. With polling, outgoing packets travel in HTTP POST requests. The local UI turns red without waiting for a server acknowledgement, so `Disconnected as Alice.` can appear before Bob sees `Alice disconnected.`. If the packet reaches the server and no other Alice sockets remain, departure is normally detected promptly; there is no mandatory heartbeat wait.
+
+Closing a page, losing network access, or suspending a browser can lose or delay that packet. Both Alice tabs can look disconnected while the server still tracks an old Alice socket. This demo does not override Socket.IO 4.8.4's heartbeat defaults: [`pingInterval`](https://socket.io/docs/v4/server-options/#pinginterval) is 25,000 ms and [`pingTimeout`](https://socket.io/docs/v4/server-options/#pingtimeout) is 20,000 ms. The server sends a ping at the interval and waits up to the timeout for a pong. The client also treats a missing ping over the combined interval and timeout as a lost connection. For an undetected loss, that gives a 45-second heartbeat window, not a fixed departure delay or a maximum end-to-end delivery time. Network, proxy, and browser scheduling can affect when another tab displays the event.
+
+HTTP long-polling does **not** check the chat every 25 seconds. A held polling request can return when the server has an event to deliver; the heartbeat checks connectivity, not notification cadence. To distinguish the paths, inspect the existing `server.js` disconnect log: `client namespace disconnect` normally follows an explicit disconnect, `ping timeout` means the heartbeat deadline expired, and `transport close` or `transport error` indicates transport shutdown or failure. That handler already logs the reason, so no extra listener is needed. These are the server's observations, not proof of a person's attention, and delay alone does not establish the cause.
 
 **Reset chat clears all users' history, not just your tab.** Any connected demo user can send `chat:reset` with `{}`. Its acknowledgement is `{ ok: true }`, without an item. The server empties every history and broadcasts `chat:reset` with `{ by }`:
 

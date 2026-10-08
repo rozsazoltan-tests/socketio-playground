@@ -96,6 +96,8 @@ function validPayload(payload, allowedKeys) {
 function createDemoServer() {
   // Each demo user owns a capped in-memory inbox; this state is not durable storage.
   const histories = new Map(USERS.map((user) => [user.id, []]));
+  // Keep one active-socket set per known persona; membership tracks that user's open tabs.
+  const activeSocketIdsByUser = new Map(USERS.map((user) => [user.id, new Set()]));
   let actionQueue = Promise.resolve();
 
   // This HTTP server serves pages and APIs. Socket.IO attaches below on the same port.
@@ -178,6 +180,15 @@ function createDemoServer() {
     socket.data.userId = userId;
     next();
   });
+
+  function broadcastPresence(userId, state) {
+    // Use validated server identity. Presence means live sockets, not human activity, and is never stored.
+    io.emit("chat:presence", {
+      user: USERS_BY_ID.get(userId),
+      state,
+      createdAt: new Date().toISOString(),
+    });
+  }
 
   function historyFor(userId) {
     return histories.get(userId);
@@ -293,11 +304,16 @@ function createDemoServer() {
   // socket.id is transient per connection; one selected demo userId can span tabs and reconnects.
   io.on("connection", (socket) => {
     const userId = socket.data.userId;
+    const activeSocketIds = activeSocketIdsByUser.get(userId);
+    const wasOffline = activeSocketIds.size === 0;
+    activeSocketIds.add(socket.id);
     // Assign rooms server-side. Each socket joins the public room and its persona's private room.
     socket.join(["chat:all", userRoom(userId)]);
     console.log("Socket.IO connected", userId, socket.id);
     // socket.emit sends only to this connection. Reconnects rerun middleware and receive a fresh snapshot.
     socket.emit("chat:state", snapshotFor(userId));
+    // Deliver initial state first; announce only the transition from zero active sockets.
+    if (wasOffline) broadcastPresence(userId, "connected");
 
     // socket.on registers a custom client event. Derive sender from socket.data.userId, not payload.
     socket.on("chat:send", (payload, ack) => {
@@ -372,6 +388,10 @@ function createDemoServer() {
 
     // Disconnect removes the socket, not history. Reconnects validate, rejoin rooms, and get a current snapshot.
     socket.on("disconnect", (reason) => {
+      const activeSocketIds = activeSocketIdsByUser.get(userId);
+      const wasTracked = activeSocketIds.delete(socket.id);
+      // Transport loss and shutdown use this path too; announce offline only after the last socket leaves.
+      if (wasTracked && activeSocketIds.size === 0) broadcastPresence(userId, "disconnected");
       console.log("Socket.IO disconnected", userId, reason);
     });
   });
